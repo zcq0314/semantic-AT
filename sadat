@@ -1,19 +1,3 @@
-
-def build_char2word(sent_text: str):
-    spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
-    char2word = [None] * len(sent_text)
-    for w_idx, (_, st, ed) in enumerate(spans):
-        for pos in range(st, ed):
-            char2word[pos] = w_idx
-    last = -1
-    for i, v in enumerate(char2word):
-        if v is None:
-            char2word[i] = last
-        else:
-            last = v
-    return char2word
-
-
 class SadatTrainer:
     def __init__(
             self,
@@ -241,3 +225,18 @@ class SadatTrainer:
                 break
 
         return train_loss, train_step, current_logits_temp
+
+def build_char2word(sent_text: str):
+    spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
+    char2word = [None] * len(sent_text)
+    for w_idx, (_, st, ed) in enumerate(spans):
+        for pos in range(st, ed):
+            char2word[pos] = w_idx
+    last = -1
+    for i, v in enumerate(char2word):
+        if v is None:
+            char2word[i] = last
+        else:
+            last = v
+    return char2word
+
