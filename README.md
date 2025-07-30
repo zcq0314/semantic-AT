@@ -37,9 +37,4 @@ python run_sadat.py \
 * jieba
 * HowNet Toolkit (for Chinese synonym mining)
 
-Install dependencies via:
-
-```bash
-pip install -r requirements.txt
-```
 
