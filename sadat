@@ -1,3 +1,42 @@
+import os
+from typing import Optional, Dict
+
+import jieba
+import transformers
+from pygments.lexers import math
+from torch.cuda.amp import autocast, GradScaler
+import torch
+from tqdm import tqdm
+import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, BertTokenizer, BertTokenizerFast, TFGPT2LMHeadModel, \
+    AutoModelForCausalLM
+import math
+import numpy as np
+
+from candidate_pool_word import generate_candidates
+from sparse_delta import update_delta
+
+
+def build_char2word(sent_text: str):
+    """
+    将句子拆成词后，返回按字符索引映射到词索引的列表
+    """
+    spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
+    char2word = [None] * len(sent_text)
+    for w_idx, (_, st, ed) in enumerate(spans):
+        for pos in range(st, ed):
+            char2word[pos] = w_idx
+    # 万一出现 None（罕见符号被 jieba 忽略）就自补
+    last = -1
+    for i, v in enumerate(char2word):
+        if v is None:
+            char2word[i] = last
+        else:
+            last = v
+    return char2word
+
+
 class SadatTrainer:
     def __init__(
             self,
@@ -22,12 +61,12 @@ class SadatTrainer:
             id2label: Optional[Dict] = None,
             reg_lambda_entropy=0.01,
             reg_lambda_kl=0.01,
-            logits_temperature=1.1,
+            logits_temperature=1.0,
             label_smoothing=0.0,
             temp_schedule=None,
             temp_warmup_steps=None,
-            clean_loss_weight=0.3,
-            adv_loss_weight=0.7
+            clean_loss_weight=0.5,
+            adv_loss_weight=0.5
     ):
         # Initialize weights and modules
         self.adv_loss_weight = adv_loss_weight
@@ -62,6 +101,11 @@ class SadatTrainer:
         self.adv_path = os.path.join(self.output_dir, fname)
         self.id2label = id2label or {}
 
+        # Create file for adv samples
+        if not os.path.exists(self.adv_path):
+            with open(self.adv_path, "w", encoding="utf-8") as f:
+                f.write("guid\ttrue_label\torig_pred\torig_text\tadv_text\tadv_pred\n")
+
         # Regularization weights
         self.reg_lambda_entropy = reg_lambda_entropy
         self.reg_lambda_kl = reg_lambda_kl
@@ -78,6 +122,22 @@ class SadatTrainer:
         else:
             self.temp_scheduler = None
 
+    def _linear_temp_schedule(self, step):
+        if step < self.temp_warmup_steps:
+            return self.initial_logits_temperature * (step / self.temp_warmup_steps)
+        return self.initial_logits_temperature
+
+    def _cosine_temp_schedule(self, step):
+        if step < self.temp_warmup_steps:
+            return self.initial_logits_temperature * (1 - math.cos(math.pi * step / self.temp_warmup_steps)) / 2
+        return self.initial_logits_temperature
+
+    def label_smoothing_loss(self, logits, target, epsilon, num_classes):
+        log_probs = F.log_softmax(logits, dim=-1)
+        one_hot = torch.zeros_like(logits).scatter(1, target.unsqueeze(1), 1)
+        smoothed_target = one_hot * (1 - epsilon) + epsilon / num_classes
+        loss = -(smoothed_target * log_probs).sum(dim=-1).mean()
+        return loss
 
     def step(self, input_data):
         self.model.train()
@@ -177,7 +237,7 @@ class SadatTrainer:
                 delta.requires_grad_()
 
             # Project perturbations to discrete tokens
-            # ... (multi-distribution candidate pool logic) ...
+            # ... (unchanged multi-distribution candidate pool logic) ...
 
             # Combine clean and adversarial loss
             loss = self.clean_loss_weight * loss_clean + self.adv_loss_weight * loss_ptb
@@ -204,5 +264,3 @@ class SadatTrainer:
                 break
 
         return train_loss, train_step, current_logits_temp
-
-
