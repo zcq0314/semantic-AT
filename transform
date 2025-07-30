@@ -1,0 +1,327 @@
+import numpy as np
+import re
+from collections import defaultdict
+from pypinyin import pinyin, lazy_pinyin, Style
+import random
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def is_alpha(s, alpha_pattern='^[a-zA-Z\\s012⚬θαενγ_|`~-]+$'): 
+  return re.match(alpha_pattern, s) is not None
+
+
+class Transform():
+  def __init__(self, debug=False):
+    self.debug = debug
+    self.transformed_tokens = []
+    self.mean_scores = []  
+    self.max_scores = []  
+
+  def clear(self):
+    self.transformed_tokens = []
+
+  def multi_ptr_trans(self, tokens, indices):
+    new_tokens = tokens[:]
+    for idx in indices:
+      new_tokens[idx] = self._transform(new_tokens[idx])
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, target_token):
+    raise NotImplementedError
+
+
+class PhoneticTransform(Transform):
+  def __init__(self, first_letter=False):
+    super().__init__()
+    self.first_letter = first_letter
+
+  def __call__(self, tokens, idx):
+    target_token = tokens[idx]
+    if idx > 0:
+      left_token = tokens[idx - 1]
+      if is_alpha(left_token):
+        return None
+    if idx + 1 < len(tokens):
+      right_token = tokens[idx + 1]
+      if is_alpha(right_token):
+        return None
+
+    new_token = self._transform(target_token)
+    if new_token == target_token:
+      return None
+
+    new_tokens = tokens[:]
+    new_tokens[idx] = new_token
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, target_token):
+    try:
+      py = lazy_pinyin(target_token)
+      if self.first_letter:
+        py = [s[0] for s in py]
+        py = ''.join(py)
+      else:
+        py = ' '.join(py)
+    except:
+      logger.error(f'PhoneticTransform error:{target_token}')
+      py = target_token
+    return py
+
+  def multi_ptr_trans(self, tokens, indices):
+    new_tokens = tokens[:]
+    for idx in indices:
+      new_tokens[idx] = self._transform(new_tokens[idx])
+    return new_tokens
+
+
+class RadicalTransform(Transform):
+  def __init__(self, radical_path, max_radicals_lengths=3):
+    super().__init__()
+    self.radical_map = {}
+    with open(radical_path, encoding='utf-8') as f:
+      for line in f:
+        data = line.strip().split('\t')
+        word = data[0]
+        if word == '□':
+          continue
+        radicals = data[-1].split()
+        if len(radicals) > max_radicals_lengths:
+          continue
+        self.radical_map[word] = radicals
+
+  def __call__(self, tokens, idx):
+    new_chars = []
+    target_token = tokens[idx]
+    for char in tokens[idx]:
+      if char not in self.radical_map:
+        new_chars.append(char)
+      else:
+        new_chars.extend(self.radical_map[char])
+    new_token = ''.join(new_chars)
+    if new_token == target_token:
+      return None
+
+    new_tokens = tokens[:idx] + [new_token] + tokens[idx + 1:]
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+
+class ShapeTransform(Transform):
+  def __init__(self):
+    super().__init__()
+    equal_sets = [
+      ['1', 'l', 'i'],
+      ['0', 'o', 'O'],
+      ['s', '$', ],
+      ['a', '@'],
+      ['2', 'z'],
+    ]
+    self.transform_dict = defaultdict(list)
+    for equal_set in equal_sets:
+      for i in range(len(equal_set)):
+        self.transform_dict[equal_set[i]].extend(equal_set[:i] + equal_set[i + 1:])  # 不算自己的方法
+        # self.transform_dict[equal_set[i]].extend(equal_set)  #  带自己
+    for key in self.transform_dict:
+      self.transform_dict[key] = list(set(self.transform_dict[key]))
+
+  def __call__(self, tokens, idx):
+    target_token = tokens[idx]
+    new_token = ''.join([self._transform(char) for char in target_token])
+    if new_token == target_token:
+      return None
+    new_tokens = tokens[:idx] + [new_token] + tokens[idx + 1:]
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, char):
+    if char in self.transform_dict:
+      return random.choice(self.transform_dict[char])
+    else:
+      return char
+
+
+class PronunciationTransform(Transform):
+  def __init__(self, chinese_chars_file, N=5):
+    super().__init__()
+    self.lazy_pinyin_dict = defaultdict(list)
+    self.pinyin_dict = defaultdict(list)
+    with open(chinese_chars_file, encoding='utf-8') as f:
+      processed_char_set = set()
+      for char in f:
+        char = char.strip()
+        if char in processed_char_set:
+          continue
+        processed_char_set.add(char)
+        py = pinyin(char)
+        if len(py) > 0:
+          self.pinyin_dict[py[0][-1]].append(char)
+        lazy_py = lazy_pinyin(char)
+        if len(lazy_py) > 0:
+          self.lazy_pinyin_dict[lazy_py[-1]].append(char)
+    self.N = N
+
+  def __call__(self, tokens, idx):
+    target_token = tokens[idx]
+    new_token = ''.join([self._transform(char) for char in target_token])
+    if target_token == new_token:
+      return None
+
+    new_tokens = tokens[:idx] + [new_token] + tokens[idx + 1:]
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, char):
+    candidates = []
+    candidates.extend(self.pinyin_dict_transform(char, self.N))
+    candidates.extend(self.lazy_pinyin_dict_transform(char, self.N))
+    candidates = list((set(candidates) | {char}) - {char})
+    if len(candidates) == 0:
+      return char
+
+    # probs = prob_calculator.calc_probs(char, candidates)
+    probs = None
+    new_char = np.random.choice(candidates, 1, p=probs)[0]
+    return new_char
+
+  def pinyin_dict_transform(self, char, N):
+    py = pinyin(char)
+    if len(py) > 0 and py[0][-1] in self.pinyin_dict:
+      return self.pinyin_dict[py[0][-1]][:N]
+    else:
+      return []
+
+  def lazy_pinyin_dict_transform(self, char, N):
+    lazy_py = lazy_pinyin(char)
+    if len(lazy_py) > 0 and lazy_py[-1] in self.lazy_pinyin_dict:
+      return self.lazy_pinyin_dict[lazy_py[-1]][:N]
+    else:
+      return []
+
+
+class StrictSameRadicalTransform(Transform):
+  def __init__(self, radical_path, max_radicals_lengths=2):
+    super().__init__()
+    self.word2radical = {}
+    self.radical2word = {}
+    with open(radical_path, encoding='utf-8') as f:
+      for line in f:
+        data = line.strip().split('\t')
+        word = data[0]
+        if word == '□':
+          continue
+        py = lazy_pinyin(word)
+        if not py:
+          continue
+        py_first_letter = py[-1][0]
+        radicals = data[-1].split()
+        if len(radicals) > max_radicals_lengths:
+          continue
+
+        last_radical = radicals[-1]
+        if last_radical not in self.radical2word:
+          self.radical2word[last_radical] = defaultdict(list)
+
+        self.radical2word[last_radical][py_first_letter].append(word)
+        self.word2radical[word] = radicals
+
+  def __call__(self, tokens, idx):
+    target_token = tokens[idx]
+    new_token = ''.join([self._transform(char) for char in target_token])
+    if new_token == target_token:
+      return None
+
+    new_tokens = tokens[:idx] + [new_token] + tokens[idx + 1:]
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, char):
+    if char not in self.word2radical:
+      return char
+    else:
+      last_radical = self.word2radical[char][-1]
+      py = lazy_pinyin(char)
+      if len(py) > 0 and last_radical in self.radical2word:
+        py_first_letter = py[-1][0]
+        return random.choice(self.radical2word[last_radical][py_first_letter])
+      else:
+        return char
+
+
+class SimpleSameRadicalTransform(Transform):
+  def __init__(self, radical_path, max_radicals_lengths=2):
+    super().__init__()
+    self.word2radical = {}
+    self.radical2word = defaultdict(list)
+    with open(radical_path, encoding='utf-8') as f:
+      for line in f:
+        data = line.strip().split('\t')
+        word = data[0]
+        if word == '□':
+          continue
+        radicals = data[-1].split()
+        if len(radicals) > max_radicals_lengths:
+          continue
+
+        last_radical = radicals[-1]
+        self.radical2word[last_radical].append(word)
+        self.word2radical[word] = radicals
+
+  def __call__(self, tokens, idx):
+    target_token = tokens[idx]
+    new_token = ''.join([self._transform(char) for char in target_token])
+    if new_token == target_token:
+      return None
+
+    new_tokens = tokens[:idx] + [new_token] + tokens[idx + 1:]
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def _transform(self, char):
+    if char not in self.word2radical:
+      return char
+    else:
+      last_radical = self.word2radical[char][-1]
+      if last_radical in self.radical2word:
+        return random.choice(self.radical2word[last_radical])
+      else:
+        return char
+
+class SequentialModel(Transform):
+  def __init__(self, transforms):
+    super().__init__()
+    self.transforms = transforms
+
+  def __call__(self, tokens, idx):
+    new_tokens = tokens[:]
+    for transform in self.transforms:
+      new_tokens_ = transform(new_tokens, idx)
+      if new_tokens_ is not None:
+        new_tokens = new_tokens_
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def multi_ptr_trans(self, tokens, indices):
+    new_tokens = tokens[:]
+    for transform in self.transforms:
+      new_tokens_ = transform.multi_ptr_trans(new_tokens, indices)
+      if new_tokens_ is not None:
+        new_tokens = new_tokens_
+    if self.debug:
+      self.transformed_tokens.append(new_tokens)
+    return new_tokens
+
+  def __str__(self) -> str:
+    return '\t'.join([str(transform) for transform in self.transforms])
