@@ -305,6 +305,66 @@ class SadatTrainer:
 
             # Project perturbations to discrete tokens
             # ... (unchanged multi-distribution candidate pool logic) ...
+            adv_embeds = inputs_embeds + delta
+            batch_embeds = inputs_embeds + delta
+            B, L, d = batch_embeds.shape
+            adv_ids = []
+            for b in range(B):
+                tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b])
+                sent_text = "".join([t.replace("##", "") 
+                                     for t in tokens
+                                     if not t.startswith("[")])  # 过滤 [CLS]/[SEP]
+                word_spans = list(jieba.tokenize(sent_text))  # [(word, start, end)]
+                char2word = build_char2word(sent_text)
+                tokens_char = [t.replace("##", "")
+                               for t in tokens
+                               if not t.startswith("[")]
+                token2word = []
+                char_ptr = 0
+                for tk in tokens:
+                    if tk.startswith("["): 
+                        token2word.append(None) 
+                        continue
+                    clean = tk.replace("##", "") 
+                    token2word.append(char2word[char_ptr])  
+                    char_ptr += len(clean)  
+
+                for widx, (_, s, e) in enumerate(word_spans):
+                    for pos in range(s, e):
+                        char2word[pos] = widx
+                new_ids = input_ids[b].tolist()
+                for pos in range(L):
+                    if torch.allclose(delta[b, pos], torch.zeros_like(delta[b, pos])):
+                        continue
+                    if tokens[pos].startswith("["):
+                        continue
+                    cands = generate_candidates(tokens, pos, sent_text=sent_text,
+                                                char2word=token2word, topk_sem=self.cand_topk)
+                    if not cands:
+                        continue
+                    cand_tokens, _ = zip(*cands)
+                    cand_ids = self.tokenizer.convert_tokens_to_ids(list(cand_tokens))
+                    cand_embeds = self.model.get_input_embeddings()(
+                        torch.tensor(cand_ids, device=delta.device))  # (K, d)
+                    diff = cand_embeds - batch_embeds[b, pos]  # (K, d)
+                    dist = torch.norm(diff, p=2, dim=1)  # (K,)
+                    for idx in torch.argsort(dist):
+                        if cand_ids[idx] != input_ids[b, pos].item(): 
+                            new_ids[pos] = cand_ids[idx]
+                            break
+                adv_ids.append(new_ids)
+
+            for b in range(B):
+                if adv_ids[b] == input_ids[b].tolist():
+                    pos = torch.argmax(grad_norm_per_token[b]).item()
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b])
+                    cands = [c for c in generate_candidates(tokens, pos, sent_text=sent_text,
+                                                            char2word=token2word, topk_sem=self.cand_topk)
+                             if c[0] != tokens[pos]]
+                    if cands:  
+                        cand_ids = self.tokenizer.convert_tokens_to_ids([c[0] for c in cands])
+                        adv_ids[b][pos] = cand_ids[0]
+            adv_input_ids = torch.tensor(adv_ids, device=delta.device)
 
             # Combine clean and adversarial loss
             loss = self.clean_loss_weight * loss_clean + self.adv_loss_weight * loss_ptb
