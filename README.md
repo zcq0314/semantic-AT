@@ -1,11 +1,10 @@
 # SADAT: Semantic-Aware Dual-Granularity Adversarial Training
 
 This repository provides the official implementation of **SADAT**, a Semantic-Aware Dual-Granularity Adversarial Training framework proposed for improving the adversarial robustness of Chinese NLP models. 
-## 🔍 Overview
 
 SADAT introduces a structured adversarial training pipeline tailored for Chinese NLP tasks. It integrates **Dual-granularity Localization Mechanism**,**Adaptive Sparse Perturbation Strategy**, **Multi-Distribution Candidate Pool**, and **Semantic Consistency Regularization** to improve model robustness.
 
-## 🗂️ Directory Structure
+## Directory Structure
 
 ```
 SADAT/
