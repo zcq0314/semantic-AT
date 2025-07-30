@@ -1,12 +1,146 @@
+from __future__ import absolute_import, division, print_function
+import argparse
+import csv
+import logging
+import os
+import random
+import math
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+import sklearn.metrics as mtc
+from scipy.stats import spearmanr
+from tqdm import tqdm, trange
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import SchedulerType, get_scheduler
+from sadat import Trainer, sadatTrainer
+
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+                    datefmt="%m/%d/%Y %H:%M:%S",
+                    level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class InputExample(object):
+    def __init__(self, guid, text_a, text_b=None, label=None):
+        self.guid = guid
+        self.text_a = text_a
+        self.text_b = text_b
+        self.label = label
+
+
+class InputFeatures(object):
+    def __init__(self, input_ids, input_mask, segment_ids, label_id):
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+        self.label_id = label_id
+
+
+class DataProcessor(object):
+    """Base class for data converters for sequence classification data sets."""
+
+    def get_train_examples(self, data_dir):
+        """Gets a collection of `InputExample`s for the train set."""
+        raise NotImplementedError()
+
+    def get_dev_examples(self, data_dir):
+        """Gets a collection of `InputExample`s for the dev set."""
+        raise NotImplementedError()
+
+    def get_labels(self):
+        """Gets the list of labels for this data set."""
+        raise NotImplementedError()
+
+    @classmethod
+    def _read_tsv(cls, input_file, quotechar=None):
+        """Reads a tab separated value file."""
+        with open(input_file, 'r', encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter='\t', quotechar=quotechar)
+            lines = []
+            for line in reader:
+                lines.append(line)
+            return lines
+
+
+def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer):
+
+    label_map = {label: i for i, label in enumerate(label_list)}
+    features = []
+    for i, example in enumerate(examples):
+        if example.text_b:
+            encoded_inputs = tokenizer(example.text_a,
+                                       example.text_b,
+                                       max_length=max_seq_length,
+                                       padding="max_length",
+                                       truncation=True,
+                                       return_token_type_ids=True)
+        else:
+            encoded_inputs = tokenizer(example.text_a,
+                                       max_length=max_seq_length,
+                                       padding="max_length",
+                                       truncation=True,
+                                       return_token_type_ids=True)
+        input_ids = encoded_inputs["input_ids"]
+        input_mask = encoded_inputs["attention_mask"]
+        segment_ids = encoded_inputs["token_type_ids"]
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+
+        if len(label_list) == 1:
+            label_id = example.label
+        else:
+            label_id = label_map[example.label]
+        if i < 5:
+            logger.info("*** Example ***")
+            logger.info("guid: %s" % example.guid)
+            logger.info("tokens: %s" % ' '.join(tokens))
+            logger.info("input_ids: %s" % ' '.join([str(x) for x in input_ids]))
+            logger.info("input_mask: %s" % ' '.join([str(x) for x in input_mask]))
+            logger.info("segment_ids: %s" % ' '.join([str(x) for x in segment_ids]))
+            logger.info("label: %s (id = %s)" % (example.label, label_id))
+
+        features.append(
+            InputFeatures(input_ids=input_ids,
+                          input_mask=input_mask,
+                          segment_ids=segment_ids,
+                          label_id=label_id)
+        )
+
+    return features
+
+
+class Metrics:
+    @staticmethod
+    def acc(predictions, labels):
+        return mtc.accuracy_score(labels, predictions)
+
+    @staticmethod
+    def mcc(predictions, labels):
+        return mtc.matthews_corrcoef(labels, predictions)
+
+    @staticmethod
+    def spc(predictions, labels):
+        return spearmanr(labels, predictions)[0]
+
+    @staticmethod
+    def f1(predictions, labels, average="micro"):
+        return mtc.f1_score(labels, predictions, average=average)
+
+
 def main():
     parser = argparse.ArgumentParser()
 
     # Data config
-    parser.add_argument("--data_dir", type=str,
+    parser.add_argument("--data_dir", type=str, default="data/",
                         help="Directory to contain the input data for all tasks.")
-    parser.add_argument("--task_name", type=str,
+    parser.add_argument("--task_name", type=str, default="",
                         help="Name of the training task.")
-    parser.add_argument("--load_model_path", type=str,
+    parser.add_argument("--load_model_path", type=str, default="",
                         help="Pre-trained language model to load.")
     parser.add_argument("--cache_dir", type=str, default="../cache/",
                         help="Directory to store the pre-trained language models downloaded from s3.")
@@ -51,7 +185,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for initialization.")
     parser.add_argument("--sadat", action="store_true",
-                        help="To do SADAT if passed.")
+                        help="To do sadat if passed.")
     parser.add_argument("--adv_steps", type=int, default=2,
                         help="Inner ascent steps for AT.")
     parser.add_argument("--adv_lr", type=float, default=1e-1,
@@ -85,6 +219,7 @@ def main():
                         help="Weight for adversarial loss")
     args = parser.parse_args()
 
+
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     n_gpu = torch.cuda.device_count()
     logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
@@ -103,6 +238,8 @@ def main():
 
     if args.do_train:
         torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
+    elif args.do_test:
+        torch.save(args, os.path.join(args.output_dir, "test_args.bin"))
 
     task_name = args.task_name.lower()
     if task_name not in processors:
@@ -111,7 +248,7 @@ def main():
     processor = processors[task_name]()
     label_list = processor.get_labels()
     num_labels = len(label_list)
-    id2label = {idx: lbl for idx, lbl in enumerate(label_list)} 
+    id2label = {idx: lbl for idx, lbl in enumerate(label_list)}  
 
     cache_dir = args.cache_dir
     # load_state_dict = args.load_state_dict
@@ -119,8 +256,9 @@ def main():
                                               do_lower_case=args.do_lower_case,
                                               cache_dir=cache_dir)
 
+
     if args.do_train:
-        train_examples = processor.get_train_examples(os.path.join(args.data_dir, task_name))  
+        train_examples = processor.get_train_examples(os.path.join(args.data_dir, task_name))
         train_features = convert_examples_to_features(train_examples, label_list, args.max_seq_length,
                                                       tokenizer)  
 
@@ -185,7 +323,7 @@ def main():
         logger.info("  Num steps = %d", args.max_train_steps)
 
         if args.sadat:
-            trainer = SADATTrainer(model, tokenizer, optimizer, scheduler, args.max_train_steps,
+            trainer = sadatTrainer(model, tokenizer, optimizer, scheduler, args.max_train_steps,
                                    args.gradient_accumulation_steps,
                                    args.fp16,
                                    args.adv_steps, args.adv_lr, args.adv_max_norm, args.adv_epsilon, args.adv_temp,
@@ -198,6 +336,7 @@ def main():
                                    temp_schedule=args.temp_schedule,
                                    temp_warmup_steps=args.temp_warmup_steps, adv_loss_weight=args.adv_loss_weight,
                                    clean_loss_weight=args.clean_loss_weight)
+
 
         best_epoch = 0
         best_result = 0.0
@@ -257,7 +396,12 @@ def main():
                     "loss": loss,
                     "eval_loss": eval_loss,
                     "eval_acc": eval_acc,
-                    "current_temperature": current_temp,
+                    # "average_similarity": average_similarity,
+                    "current_temperature": current_temp,  # 新增温度记录
+                    # "Perplexity":avg_perplexity,
+                    # "BLEU Score":avg_bleu,
+                    # "ASR":avg_attack_success
+
                 }
                 if result["eval_acc"] > best_result:
                     best_epoch = epoch
@@ -268,19 +412,78 @@ def main():
                 def printf():
                     with open(output_eval_file, 'a') as writer:
                         writer.write(
+                            # "Epoch %s: global step = %s | train loss = %.3f | eval score = %.2f | eval loss = %.3f | average_similarity = %.4f | Perplexity = {avg_perplexity:%.2f}, BLEU Score = {avg_bleu:%.2f}, ASR = {avg_attack_success:%.2f}"
                             "Epoch %s: global step = %s | train loss = %.3f | eval score = %.2f | eval loss = %.3f | temperature = %.3f\n}"
                             % (str(epoch),
                                str(result["global_step"]),
                                result["loss"],
                                result["eval_acc"],
                                result["eval_loss"],
+                               # result["average_similarity"],
                                result["current_temperature"]))
+                        # result["Perplexity"]))
+                        # result["BLEU Score"],
+                        # result["ASR"]))
 
                 printf()
                 for key in sorted(result.keys()):
                     logger.info("Epoch: %s,  %s = %s", str(epoch), key, str(result[key]))
             logger.info("Best epoch: %s, result:  %s", str(best_epoch), str(best_result))
 
+    if args.do_test:
+        eval_examples = processor.get_test_examples(os.path.join(args.data_dir, task_name))
+        eval_features = convert_examples_to_features(eval_examples, label_list, args.max_seq_length, tokenizer)
+        all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
+        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids)
+        eval_sampler = SequentialSampler(eval_data)
+        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+        logger.info("***** Running test *****")
+        logger.info("  Num examples = %d", len(eval_examples))
+        logger.info("  Batch size = %d", args.eval_batch_size)
+        predict_model = AutoModelForSequenceClassification.from_pretrained(args.load_model_path,
+                                                                           state_dict=torch.load(args.load_state_dict),
+                                                                           num_labels=num_labels,
+                                                                           return_dict=True,
+                                                                           cache_dir=cache_dir)
+        predict_model.to(device)
+        predict_model.eval()
+        predictions = []
+        for input_ids, input_mask, segment_ids in tqdm(eval_dataloader, desc="Testing"):
+            input_ids = input_ids.to(device)
+            input_mask = input_mask.to(device)
+            segment_ids = segment_ids.to(device)
+            with torch.no_grad():
+                outputs = predict_model(input_ids=input_ids,
+                                        attention_mask=input_mask,
+                                        token_type_ids=segment_ids)
+                logits = outputs.logits
+
+            logits = logits.detach().cpu().numpy()
+            for (i, prediction) in enumerate(logits):
+                if task_name == "sts-b":
+                    predict_label = prediction[0]
+                else:
+                    predict_label = np.argmax(prediction)
+                predictions.append(predict_label)
+
+        output_test_file = os.path.join(args.output_dir, "{}-m.tsv".format(args.task_name))
+        with open(output_test_file, 'w') as writer:
+            writer.write("index" + "\t" + "prediction" + "\n")
+            for index, pred in enumerate(predictions):
+                if task_name == "sts-b":
+                    if pred > 5:
+                        pred = 5.
+                    if pred < 0:
+                        pred = 0.
+                    writer.write(str(index) + "\t" + str(pred) + "\n")
+                else:
+                    writer.write(str(index) + "\t" + str(label_list[int(pred)]) + "\n")
+        del predictions[:]
+
+        
 
 if __name__ == "__main__":
     main()
