@@ -90,15 +90,13 @@ class Trainer:
 
 
 def build_char2word(sent_text: str):
-    """
-    将句子拆成词后，返回按字符索引映射到词索引的列表
-    """
+
     spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
     char2word = [None] * len(sent_text)
     for w_idx, (_, st, ed) in enumerate(spans):
         for pos in range(st, ed):
             char2word[pos] = w_idx
-    # 万一出现 None（罕见符号被 jieba 忽略）就自补
+
     last = -1
     for i, v in enumerate(char2word):
         if v is None:
