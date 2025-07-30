@@ -12,7 +12,7 @@ from torch.nn.functional import cosine_similarity
 import math
 import numpy as np
 
-from candidate_pool_word import generate_candidates
+from candidate_pool import generate_candidates
 from sparse_delta import update_delta
 
 class Trainer:
