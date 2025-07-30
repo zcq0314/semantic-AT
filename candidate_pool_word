@@ -1,0 +1,145 @@
+
+from typing import List, Tuple, Dict
+import torch
+import numpy as np
+from OpenHowNet import HowNetDict
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+import jieba, OpenHowNet as hownet
+
+
+def _get_synonyms(word: str, topk: int = 10):
+
+    if _hndict is None:
+        return []
+
+    try:
+        
+        if hasattr(_hndict, "get_synonyms"):
+            syns = _hndict.get_synonyms(word, language="zh")
+        
+        elif hasattr(_hndict, "get_synonyms_by_word"):
+            syns = _hndict.get_synonyms_by_word(word)
+        else:  
+            return []
+
+        return [w for w in syns if w and w != word][:topk]
+    except Exception as e:
+        print(f"get failed '{word}': {e}")
+        return []
+
+
+_MLM_NAME = "model-name/"         
+_MLM_TOPK = 20                          
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+_mlm_tok: AutoTokenizer = AutoTokenizer.from_pretrained(_MLM_NAME)
+_mlm: AutoModelForMaskedLM = (AutoModelForMaskedLM
+                              .from_pretrained(_MLM_NAME)
+                              .to(_DEVICE).eval())
+jieba.initialize()
+
+
+_embedding_weight: torch.Tensor = _mlm.get_input_embeddings().weight.detach()  # (V, d)
+_embedding_norm = _embedding_weight / _embedding_weight.norm(dim=1, keepdim=True)
+
+
+
+from roc.transform import PhoneticTransform, ShapeTransform, RadicalTransform
+
+_phonetic = PhoneticTransform()       
+_shape    = ShapeTransform()          
+_radical  = RadicalTransform('roc/Cdata/chaizi/chaizi-jt.txt')
+
+def _zh_variants(token: str, max_n: int = 10) -> List[str]:
+    """同音 + 形近 + 部首拆分, 仅取单字变换"""
+    outs = set()
+    for fun in (_phonetic, _shape, _radical):
+        new = fun([token], 0)
+        if new: outs.add(new[0])
+    outs.discard(token)
+    return list(outs)[:max_n]
+
+
+def generate_candidates(sent_tokens: List[str],
+                        idx: int,
+                        sent_text: str = None,       
+                        char2word: List[int] = None, 
+                        topk_sem: int = 10,
+                        weights: Dict[str, float] = None) -> List[Tuple[str, float]]:
+
+    if weights is None:
+        weights = {"mlm": 0.35, "sem": 0.35, "zh": 0.2,"syn_word":0.1}
+
+    orig_token = sent_tokens[idx]
+
+    syn_cands, syn_scores = [], []
+    if char2word and sent_text:
+        word_spans = list(jieba.tokenize(sent_text))
+        word_idx = char2word[idx]  
+        if (word_idx is None) or (word_idx >= len(word_spans)):
+            pass
+        else:
+            target_word, w_start, w_end = word_spans[word_idx]
+            if len(target_word) > 1:  
+                cand_words = _get_synonyms(target_word,topk_sem)
+                cand_words = [w for w in cand_words if w != target_word]
+                syn_cands = cand_words
+                syn_scores = [1.0] * len(cand_words)
+
+    mlm_cands, mlm_probs = _mlm_topk(sent_tokens, idx)
+
+    sem_cands, sem_sims = _semantic_neighbors(orig_token, topk_sem)
+
+    zh_cands = _zh_variants(orig_token)
+
+    zh_scores = [1.0] * len(zh_cands)
+
+
+    cand2score = {}
+    for c, p in zip(mlm_cands, mlm_probs):
+        cand2score[c] = cand2score.get(c, 0) + weights["mlm"] * p
+    for c, s in zip(sem_cands, sem_sims):
+        cand2score[c] = cand2score.get(c, 0) + weights["sem"] * s
+    for c, z in zip(zh_cands, zh_scores):
+        cand2score[c] = cand2score.get(c, 0) + weights["zh"] * z
+    for c, s in zip(syn_cands, syn_scores):
+        cand2score[c] = cand2score.get(c, 0) + weights["syn_word"] * s
+
+
+    cand2score.pop(orig_token, None)
+    if not cand2score:
+        return []
+
+    return sorted(cand2score.items(), key=lambda x: x[1], reverse=True)
+
+
+def _mlm_topk(tokens: List[str], idx: int):
+    tokens_cp = tokens[:]
+    tokens_cp[idx] = _mlm_tok.mask_token
+    input_ids = _mlm_tok(''.join(tokens_cp), return_tensors='pt').input_ids.to(_DEVICE)
+    with torch.no_grad():
+        logits = _mlm(input_ids).logits   # (1, L, V)
+    mask_pos = (input_ids[0] == _mlm_tok.mask_token_id).nonzero(as_tuple=True)[0].item()
+    topk = torch.topk(logits[0, mask_pos], _MLM_TOPK)
+    ids, probs = topk.indices.tolist(), torch.softmax(topk.values, dim=-1).tolist()
+    tokens_mlm = _mlm_tok.convert_ids_to_tokens(ids)
+    return tokens_mlm, probs
+
+def _semantic_neighbors(token: str, k: int):
+    token_id = _mlm_tok.convert_tokens_to_ids(token)
+    if token_id == _mlm_tok.unk_token_id:
+        return [], []
+    vec = _embedding_norm[token_id]                      # (d,)
+    sims = (_embedding_norm @ vec)                       # (V,)
+    topk = torch.topk(sims, k + 1)                       # +1 
+    ids, scores = topk.indices.tolist(), topk.values.tolist()
+    tokens_sem = _mlm_tok.convert_ids_to_tokens(ids)
+
+    out_cands, out_sims = [], []
+    for t, s in zip(tokens_sem, scores):
+        if t != token:
+            out_cands.append(t)
+            out_sims.append(float(s))
+        if len(out_cands) >= k:
+            break
+    return out_cands, out_sims
