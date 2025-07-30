@@ -1,0 +1,27 @@
+import torch
+
+def update_delta(delta, delta_grad,
+                 adv_lr: float = 1e-1,
+                 tau: float = 0.1,
+                 norm_type: str = 'l2'):
+    """
+    :param delta:        
+    :param delta_grad:  
+    :param adv_lr:       
+    :param tau:          
+    :param norm_type:    'l2' or 'linf'
+    """
+
+    if norm_type == 'l2':
+        g_norm = delta_grad.norm(p=2, dim=-1)            # (B, L)
+    else:
+        g_norm = delta_grad.abs().max(dim=-1).values     # linf
+
+
+    mask = (g_norm > tau).float().unsqueeze(-1)          # (B, L, 1)
+
+
+    grad_norm = delta_grad.norm(p=2, dim=-1, keepdim=True) + 1e-8
+    delta = delta + adv_lr * delta_grad / grad_norm * mask
+    delta = delta * mask
+    return delta.detach()
