@@ -44,14 +44,13 @@ _embedding_norm = _embedding_weight / _embedding_weight.norm(dim=1, keepdim=True
 
 
 
-from roc.transform import PhoneticTransform, ShapeTransform, RadicalTransform
+from transform import PhoneticTransform, ShapeTransform, RadicalTransform
 
 _phonetic = PhoneticTransform()       
 _shape    = ShapeTransform()          
-_radical  = RadicalTransform('roc/Cdata/chaizi/chaizi-jt.txt')
+_radical  = RadicalTransform()
 
 def _zh_variants(token: str, max_n: int = 10) -> List[str]:
-    """同音 + 形近 + 部首拆分, 仅取单字变换"""
     outs = set()
     for fun in (_phonetic, _shape, _radical):
         new = fun([token], 0)
