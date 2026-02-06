@@ -8,6 +8,7 @@ This repository provides the official implementation of **SADAT**, a Semantic-Aw
 SADAT/
 ├── sadat.py                    # Main training class with SADAT implementation
 ├── run_sadat.py                # Main program to run
+├── run_sadat_llm.py            # Main program to run on llm
 ├── candidate_pool.py           # candidate pool generation
 ├── sparse_delta.py             # Gradient Sparse perturbation
 ├── homologous.py               # Perturbation operations
