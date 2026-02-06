@@ -7,13 +7,35 @@ from pygments.lexers import math
 from torch.cuda.amp import autocast, GradScaler
 import torch
 from tqdm import tqdm
-import torch.nn.functional as F
+import torch
 from torch.nn.functional import cosine_similarity
+from tqdm import tqdm
+import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, BertTokenizer, BertTokenizerFast, TFGPT2LMHeadModel, \
+    AutoModelForCausalLM
 import math
 import numpy as np
+from torch.nn.functional import softmax
 
-from candidate_pool import generate_candidates
+from candidate_pool_word import generate_candidates
 from sparse_delta import update_delta
+
+
+def build_char2word(sent_text: str):
+
+    spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
+    char2word = [None] * len(sent_text)
+    for w_idx, (_, st, ed) in enumerate(spans):
+        for pos in range(st, ed):
+            char2word[pos] = w_idx
+    last = -1
+    for i, v in enumerate(char2word):
+        if v is None:
+            char2word[i] = last
+        else:
+            last = v
+    return char2word
+
 
 class Trainer:
     def __init__(
@@ -83,25 +105,9 @@ class Trainer:
             if self.global_step >= self.max_train_steps:
                 break
 
-        return train_loss, train_step
+        average_perplexity = sum(perplexities) / len(perplexities)
 
-
-
-def build_char2word(sent_text: str):
-
-    spans = list(jieba.tokenize(sent_text))  # [(word, start, end), ...]
-    char2word = [None] * len(sent_text)
-    for w_idx, (_, st, ed) in enumerate(spans):
-        for pos in range(st, ed):
-            char2word[pos] = w_idx
-
-    last = -1
-    for i, v in enumerate(char2word):
-        if v is None:
-            char2word[i] = last
-        else:
-            last = v
-    return char2word
+        return train_loss, train_step, average_perplexity
 
 
 class SadatTrainer:
@@ -117,25 +123,25 @@ class SadatTrainer:
             adv_steps=2,
             adv_lr=1e-1,
             adv_max_norm=1e-1,
-            adv_epsilon=0.1,
+            adv_epsilon=0.1, 
             adv_temp=1.0,
             adv_init_var=1e-2,
             grad_threshold=0.1,
-            sparse_tau=0.1,
-            cand_topk=20,
+            sparse_tau=0.1, cand_topk=20,
             output_dir: str = "./outputs",
             task_name: str = "task",
             id2label: Optional[Dict] = None,
+            # reg_lambda_smooth=0.01, 
             reg_lambda_entropy=0.01,
-            reg_lambda_kl=0.01,
-            logits_temperature=1.1,
-            label_smoothing=0.0,
-            temp_schedule=None,
-            temp_warmup_steps=None,
+            reg_lambda_kl=0.01, 
+            logits_temperature=1.0, 
+            label_smoothing=0.0, 
+            temp_schedule=None, 
+            temp_warmup_steps=None, 
             clean_loss_weight=0.5,
             adv_loss_weight=0.5
+
     ):
-        # Initialize weights and modules
         self.adv_loss_weight = adv_loss_weight
         self.clean_loss_weight = clean_loss_weight
         self.model = model
@@ -143,22 +149,21 @@ class SadatTrainer:
         self.word_embeddings = getattr(self.model_uw,
                                        self.model_uw.config.model_type.split("-")[0]).embeddings.word_embeddings
         self.device = model.device
-        self.fp16 = fp16
+        self.fp16 = fp16  
         if self.fp16:
-            self.scaler = GradScaler()
+            self.scaler = torch.cuda.amp.GradScaler()
         self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.max_train_steps = max_train_steps
-        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.scheduler = scheduler 
+        self.max_train_steps = max_train_steps  
+        self.gradient_accumulation_steps = gradient_accumulation_steps 
         self.global_step = 0
 
-        # Adversarial and regularization hyperparameters
         self.adv_steps = adv_steps
-        self.adv_lr = adv_lr
-        self.adv_max_norm = adv_max_norm
-        self.adv_temp = adv_temp
-        self.adv_epsilon = adv_epsilon
-        self.adv_init_var = adv_init_var
+        self.adv_lr = adv_lr 
+        self.adv_max_norm = adv_max_norm  
+        self.adv_temp = adv_temp  
+        self.adv_init_var = adv_init_var 
+        self.tokenizer = tokenizer
         self.grad_threshold = grad_threshold
         self.tau = sparse_tau
         self.cand_topk = cand_topk
@@ -167,13 +172,9 @@ class SadatTrainer:
         fname = f"{task_name}_adv_samples.tsv"
         self.adv_path = os.path.join(self.output_dir, fname)
         self.id2label = id2label or {}
+        self.adv_epsilon = adv_epsilon  
 
-        # Create file for adv samples
-        if not os.path.exists(self.adv_path):
-            with open(self.adv_path, "w", encoding="utf-8") as f:
-                f.write("guid\ttrue_label\torig_pred\torig_text\tadv_text\tadv_pred\n")
-
-        # Regularization weights
+        # self.reg_lambda_smooth = reg_lambda_smooth
         self.reg_lambda_entropy = reg_lambda_entropy
         self.reg_lambda_kl = reg_lambda_kl
         self.logits_temperature = logits_temperature
@@ -181,7 +182,6 @@ class SadatTrainer:
         self.temp_schedule = temp_schedule
         self.temp_warmup_steps = temp_warmup_steps or (max_train_steps // 10)
         self.initial_logits_temperature = logits_temperature
-        # Temperature scheduler
         if temp_schedule == 'linear':
             self.temp_scheduler = self._linear_temp_schedule
         elif temp_schedule == 'cosine':
@@ -206,6 +206,30 @@ class SadatTrainer:
         loss = -(smoothed_target * log_probs).sum(dim=-1).mean()
         return loss
 
+    def _inner_update(self, delta, delta_grad):
+        delta = update_delta(delta,
+                             delta_grad,
+                             adv_lr=self.adv_lr,
+                             tau=self.tau,
+                             norm_type='l2') 
+        if self.adv_epsilon is not None:
+            delta = torch.clamp(delta, min=-self.adv_epsilon, max=self.adv_epsilon)
+
+        # 可选：norm clip
+        if self.adv_max_norm is not None:
+            delta_norm = delta.norm(p=2, dim=-1, keepdim=True)
+            exceed_mask = (delta_norm > self.adv_max_norm).float()
+            delta = delta / (delta_norm + 1e-8) * self.adv_max_norm * exceed_mask + \
+                    delta * (1 - exceed_mask)
+        return delta
+
+    def select_important_tokens(gradients, threshold=0.1):
+        important_tokens = []
+        for i, grad in enumerate(gradients):
+            if abs(grad) > threshold:
+                important_tokens.append(i)
+        return important_tokens
+
     def step(self, input_data):
         self.model.train()
         train_loss = 0
@@ -215,18 +239,15 @@ class SadatTrainer:
             batch = tuple(t.to(self.device) for t in batch)
             input_ids, input_mask, segment_ids, labels = batch
 
-            # Update temperature
             if self.temp_scheduler:
                 current_logits_temp = self.temp_scheduler(self.global_step)
             else:
                 current_logits_temp = self.logits_temperature
 
-            # Get embeddings
             inputs_embeds = self.word_embeddings(input_ids)
 
-            # Forward clean inputs
             if self.fp16:
-                with autocast():
+                with torch.cuda.amp.autocast():
                     outputs = self.model(inputs_embeds=inputs_embeds,
                                          attention_mask=input_mask,
                                          token_type_ids=segment_ids,
@@ -239,75 +260,145 @@ class SadatTrainer:
                                      labels=labels,
                                      output_hidden_states=True)
 
-            # Compute clean loss
-            logits = outputs.logits
+            logits = outputs[1] if self.fp16 else outputs.logits
             scaled_logits = logits / current_logits_temp
+
             if self.label_smoothing > 0:
-                loss_fct = lambda logit: self.label_smoothing_loss(logit, labels, self.label_smoothing, logit.size(-1))
+                loss = self.label_smoothing_loss(
+                    scaled_logits, labels, self.label_smoothing, logits.size(-1)
+                )
             else:
-                loss_fct = lambda logit: torch.nn.CrossEntropyLoss()(logit, labels)
-            loss_clean = loss_fct(scaled_logits)
+                loss_fct = torch.nn.CrossEntropyLoss()
+                loss = loss_fct(scaled_logits, labels)
 
-            # Extract context vector
-            ctxr = outputs.hidden_states[-1][:, 0]
+            ctxr = outputs[-1][-1][:, 0]
+            with torch.no_grad():
+                orig_embeds = self.word_embeddings(input_ids)
+                orig_ctxr = outputs[-1][-1][:, 0]
 
-            # Initialize adversarial perturbation
             delta = torch.zeros_like(inputs_embeds, requires_grad=True)
             loss_ptb = 0.0
-
-            # Adversarial updates
             for j in range(self.adv_steps):
                 if self.fp16:
-                    with autocast():
-                        out_ptb = self.model(inputs_embeds=inputs_embeds + delta,
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(inputs_embeds=inputs_embeds + delta,
                                              attention_mask=input_mask,
                                              token_type_ids=segment_ids,
                                              labels=labels,
                                              output_hidden_states=True)
                 else:
-                    out_ptb = self.model(inputs_embeds=inputs_embeds + delta,
+                    outputs = self.model(inputs_embeds=inputs_embeds + delta,
                                          attention_mask=input_mask,
                                          token_type_ids=segment_ids,
                                          labels=labels,
                                          output_hidden_states=True)
 
-                adv_logits = out_ptb.logits
+                adv_logits = outputs[1] if self.fp16 else outputs.logits
                 scaled_adv_logits = adv_logits / current_logits_temp
-                loss_adv = loss_fct(scaled_adv_logits)
-                ctxr_ptb = out_ptb.hidden_states[-1][:, 0]
+                if self.label_smoothing > 0:
+                    loss_ptb = self.label_smoothing_loss(
+                        scaled_adv_logits, labels, self.label_smoothing, adv_logits.size(-1)
+                    )
+                else:
+                    loss_fct = torch.nn.CrossEntropyLoss()
+                    loss_ptb = loss_fct(scaled_adv_logits, labels)
 
-                # Semantic similarity regularization (cosine)
-                loss_ptb = loss_adv - cosine_similarity(ctxr_ptb.unsqueeze(0), ctxr.unsqueeze(0)).mean() * self.adv_temp
+                ctxr_ptb = outputs[-1][-1][:, 0]
 
-                # KL regularization
+                loss_ptb = loss_ptb - cosine_similarity(ctxr_ptb.unsqueeze(0), ctxr.unsqueeze(0)).mean() * self.adv_temp
+
                 if current_logits_temp > 1.0:
                     orig_probs = F.softmax(logits / current_logits_temp, dim=-1)
+                    adv_probs = F.softmax(adv_logits / current_logits_temp, dim=-1)
                     temp_reg = F.kl_div(F.log_softmax(adv_logits / current_logits_temp, dim=-1),
-                                        orig_probs,
-                                        reduction='batchmean')
+                                        orig_probs, reduction='batchmean')
                     loss_ptb = loss_ptb + self.reg_lambda_kl * temp_reg
-
-                # Entropy regularization
-                adv_probs = F.softmax(adv_logits / current_logits_temp, dim=-1)
-                entropy = -(adv_probs * torch.log(adv_probs + 1e-8)).sum(dim=-1).mean()
-                loss_ptb = loss_ptb + self.reg_lambda_entropy * entropy
 
                 if j == self.adv_steps - 1:
                     break
 
-                # Compute gradient and sparse update
                 delta_grad, = torch.autograd.grad(loss_ptb, delta, retain_graph=True)
-                grad_norm = delta_grad.norm(p=2, dim=-1)
-                mask = (grad_norm > self.grad_threshold).float().unsqueeze(-1)
-                update = self.adv_lr * delta_grad / (grad_norm.unsqueeze(-1) + 1e-8)
-                delta = (delta + update * mask).detach()
+
+                grad_norm_per_token = delta_grad.norm(p=2, dim=-1)
+                important_mask = (grad_norm_per_token > self.grad_threshold).float()
+                important_mask = important_mask.unsqueeze(-1)
+
+                update = self.adv_lr * delta_grad / (grad_norm_per_token.unsqueeze(-1) + 1e-8)
+                update = update * important_mask
+                delta = (delta + update).detach()
+                delta_norm = torch.norm(delta.view(delta.shape[0], -1), dim=-1, p="fro")
+                clip_mask = (delta_norm > self.adv_max_norm).float()
+                clip_weights = self.adv_max_norm / (delta_norm + 1e-8) * clip_mask + (1.0 - clip_mask)
+                delta = (delta * clip_weights.view(-1, 1, 1)).detach()
                 delta.requires_grad_()
 
-            # Project perturbations to discrete tokens
-            # ... (unchanged multi-distribution candidate pool logic) ...
-            
-            # Combine clean and adversarial loss
-            loss = self.clean_loss_weight * loss_clean + self.adv_loss_weight * loss_ptb
+            adv_embeds = inputs_embeds + delta
+            batch_embeds = inputs_embeds + delta
+            B, L, d = batch_embeds.shape
+            adv_ids = []
+            for b in range(B):
+                tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b])
+
+                sent_text = "".join([t.replace("##", "") 
+                                     for t in tokens
+                                     if not t.startswith("[")])  
+                word_spans = list(jieba.tokenize(sent_text))  # [(word, start, end)]
+                char2word = build_char2word(sent_text)
+                tokens_char = [t.replace("##", "")
+                               for t in tokens
+                               if not t.startswith("[")]
+                token2word = []
+                char_ptr = 0
+                for tk in tokens:
+                    if tk.startswith("["):  # [CLS] / [SEP] / [PAD]
+                        token2word.append(None) 
+                        continue
+
+                    clean = tk.replace("##", "") 
+                    token2word.append(char2word[char_ptr]) 
+                    char_ptr += len(clean)  
+
+                for widx, (_, s, e) in enumerate(word_spans):
+                    for pos in range(s, e):
+                        char2word[pos] = widx
+
+                new_ids = input_ids[b].tolist()
+                for pos in range(L):
+                    if torch.allclose(delta[b, pos], torch.zeros_like(delta[b, pos])):
+                        continue
+                    if tokens[pos].startswith("["):
+                        continue
+                    cands = generate_candidates(tokens, pos, sent_text=sent_text,
+                                                char2word=token2word, topk_sem=self.cand_topk)
+                    if not cands:
+                        continue
+                    cand_tokens, _ = zip(*cands)
+                    cand_ids = self.tokenizer.convert_tokens_to_ids(list(cand_tokens))
+                    cand_embeds = self.model.get_input_embeddings()(
+                        torch.tensor(cand_ids, device=delta.device))  # (K, d)
+                    diff = cand_embeds - batch_embeds[b, pos]  # (K, d)
+                    dist = torch.norm(diff, p=2, dim=1)  # (K,)
+                    for idx in torch.argsort(dist):
+                        if cand_ids[idx] != input_ids[b, pos].item(): 
+                            new_ids[pos] = cand_ids[idx]
+                            break
+                adv_ids.append(new_ids)
+
+            for b in range(B):
+                if adv_ids[b] == input_ids[b].tolist():
+                    pos = torch.argmax(grad_norm_per_token[b]).item()
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b])
+                    cands = [c for c in generate_candidates(tokens, pos, sent_text=sent_text,
+                                                            char2word=token2word, topk_sem=self.cand_topk)
+                             if c[0] != tokens[pos]]
+
+                    if cands: 
+                        cand_ids = self.tokenizer.convert_tokens_to_ids([c[0] for c in cands])
+                        adv_ids[b][pos] = cand_ids[0] 
+
+            adv_input_ids = torch.tensor(adv_ids, device=delta.device)
+            loss = self.clean_loss_weight * loss + self.adv_loss_weight * loss_ptb
+
             if self.fp16:
                 self.scaler.scale(loss).backward()
             else:
